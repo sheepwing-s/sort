@@ -150,6 +150,48 @@ class KalmanBoxTracker(object):
     """
     return convert_x_to_bbox(self.kf.x)
 
+  # --------------------------------------------------
+  # Kalman Filterの現在の値を取得する関数(追加関数)
+  # --------------------------------------------------
+  def get_kalman_data(self) -> dict:
+      """
+      Kalman Filterの現在の状態を取得する関数
+      
+      Returns:
+          Kalman Filterの状態ベクトル、共分散行列、BBOX
+      """
+      # 現在の状態ベクトル
+      state = self.kf.x.reshape(-1)
+
+      # 現在の共分散行列
+      covariance =self.kf.P
+
+      # 現在の状態からBBOXを取得
+      bbox = self.get_state()[0]
+
+      return {
+        "bbox": bbox.astype(float).tolist(),
+        "state": state.astype(float).tolist(),
+        "covariance": covariance.astype(float).tolist()
+      }
+  # --------------------------------------------------
+  # 次フレームの予測位置を取得する処理✅
+  # --------------------------------------------------
+  def predict_next_bbox(self) -> list[float]:
+      """
+      次フレームにおける人物の予測BBOXを取得する関数
+      
+      Note:
+          Kalman Filterの内部状態は更新しない
+      """
+      # 状態遷移行列を用いて次フレームの状態を予測
+      predicted_state = self.kf.F @ self.kf.x
+
+      # 予測状態からBBOXを取得
+      bbox = convert_x_to_bbox(predicted_state)[0]
+
+      return bbox.astype(float).tolist()
+
 
 def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
   """
@@ -206,6 +248,7 @@ class Sort(object):
     self.iou_threshold = iou_threshold
     self.trackers = []
     self.frame_count = 0
+    self.frame_kalman_results = [] # 追加変数✅: Kalman Filterの情報をフレームごとに保存
 
   def update(self, dets=np.empty((0, 5))):
     """
@@ -217,6 +260,11 @@ class Sort(object):
     NOTE: The number of objects returned may differ from the number of detections provided.
     """
     self.frame_count += 1
+    # 前フレームの情報をリセット
+    self.frame_kalman_results = []
+    # --------------------------------------------------
+    # 既存トラックの予測
+    # --------------------------------------------------
     # get predicted locations from existing trackers.
     trks = np.zeros((len(self.trackers), 5))
     to_del = []
@@ -224,33 +272,200 @@ class Sort(object):
     for t, trk in enumerate(trks):
       pos = self.trackers[t].predict()[0]
       trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+      # NaNが含まれる場合は削除対象にする
       if np.any(np.isnan(pos)):
         to_del.append(t)
+    # 不正な予測結果を除外する
     trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+    # 不正なトラックを削除
     for t in reversed(to_del):
       self.trackers.pop(t)
-    matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets,trks, self.iou_threshold)
-
+    # --------------------------------------------------
+    # Kalman Filterの予測値を取得
+    # --------------------------------------------------
+    kalman_records = {}
+    for trk in self.trackers:
+      # 予測直後のKalman Filter情報を取得
+      kalman_data = trk.get_kalman_data()
+      kalman_records[id(trk)] = {
+        "track_id": int(trk.id + 1),
+        "track_status": "predicted",
+        "detection_index": None,
+        # 予測値
+        "predicted_bbox": kalman_data["bbox"],
+        "predicted_state": kalman_data["state"],
+        "predicted_covariance": kalman_data["covariance"],
+        # 更新値
+        "updated_bbox": None,
+        "updated_state": None,
+        "updated_covariance": None,
+        # トラック管理情報
+        "time_since_update": int(trk.time_since_update),
+        "age": int(trk.age)
+      }
+    # --------------------------------------------------
+    # YOLOの検出結果と既存トラックの対応付け
+    # --------------------------------------------------
+    matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets, trks, self.iou_threshold)
+    # --------------------------------------------------
+    # 対応付けされたトラックの更新
+    # --------------------------------------------------
     # update matched trackers with assigned detections
     for m in matched:
-      self.trackers[m[1]].update(dets[m[0], :])
-
+      # 対応するトラックと検出結果のインデックス
+      det_index = int(m[0])
+      trk_index = int(m[1])
+      # 対応付けされたトラックを更新
+      trk = self.trackers[trk_index]
+      trk.update(dets[det_index, :])
+      # self.trackers[m[1]].update(dets[m[0], :])
+      # 更新後のKalman Filter情報を取得
+      kalman_data = trk.get_kalman_data()
+      # 予測情報に更新情報を追加
+      kalman_records[id(trk)].update({
+        "track_status": "updated",
+        "detection_index": det_index,
+        # YOLOによる検出結果
+        "detection_bbox": dets[det_index, :4].astype(float).tolist(),
+        # Kalman Filterの更新結果
+        "update_bbox": kalman_data["bbox"],
+        "update_state": kalman_data["state"],
+        "update_covariance": kalman_data["covariance"],
+        "time_since_update": int(trk.time_since_update),
+        "age": int(trk.age)
+      })
+    # --------------------------------------------------
+    # 対応付けされなかった検出結果から新規トラックを生成
+    # --------------------------------------------------
     # create and initialise new trackers for unmatched detections
     for i in unmatched_dets:
+        # 新規トラックを生成
         trk = KalmanBoxTracker(dets[i,:])
         self.trackers.append(trk)
+        # 初期化直後のKalam Filter情報を取得
+        kalman_data = trk.get_kalman_data()
+        kalman_records[id(trk)] = {
+          "track_id": int(trk.id + 1),
+          "track_status": "initialized",
+          "detection_index": int(i),
+          # YOLOによる検出結果
+          "detection_bbox": dets[i, :4].astype(float).tolist(),
+          # 初期化時の値
+          "initialized_bbox": kalman_data["bbox"],
+          "initialized_state": kalman_data["state"],
+          "initialized_covariance": kalman_data["covariance"],
+          # 予測値・更新値はまだ存在しない
+          "predicted_bbox": None,
+          "predicted_state": None,
+          "predicted_covariance": None,
+          "updated_bbox": None,
+          "updated_state": None,
+          "updated_covariance": None,
+          #トラック管理情報
+          "time_since_update": int(trk.time_since_update),
+          "age": int(trk.age)
+        }
+    # --------------------------------------------------
+    # SORTの追跡結果を生成
+    # --------------------------------------------------
     i = len(self.trackers)
     for trk in reversed(self.trackers):
         d = trk.get_state()[0]
         if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
           ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
         i -= 1
+        # 古いトラックを削除
         # remove dead tracklet
         if(trk.time_since_update > self.max_age):
           self.trackers.pop(i)
+    # --------------------------------------------------
+    # フレームごとのKalman Filter情報を保存
+    # --------------------------------------------------
+    active_tracker_ids = {id(trk) for trk in self.trackers}
+
+    self.frame_kalman_results = [
+        record
+        for tracker_id, record in kalman_records.items()
+        if tracker_id in active_tracker_ids
+    ]
+    # --------------------------------------------------
+    # SORTの追跡結果を返す
+    # --------------------------------------------------
     if(len(ret)>0):
       return np.concatenate(ret)
     return np.empty((0,5))
+
+  # --------------------------------------------------
+  # 現在フレームの人物ごとの結果を取得する関数✅
+  # --------------------------------------------------
+  def get_current_frame_results(self) -> list[dict]:
+    """
+    現在のフレームにおける人物ごとのBBOXを取得する。
+
+    検出成功時はYOLOの検出BBOX、
+    検出失敗時はKalman Filterの予測BBOXを使用する。
+    """
+
+    results = []
+
+    for record in self.frame_kalman_results:
+
+        track_status = record["track_status"]
+
+        # 検出結果と対応付けられた場合
+        if track_status in ("updated", "initialized"):
+            bbox = record["detection_bbox"]
+            source = "detection"
+
+        # 検出結果と対応付けられなかった場合
+        elif track_status == "predicted":
+            bbox = record["predicted_bbox"]
+            source = "kalman"
+
+        else:
+            continue
+
+        # BBOXが存在しない場合は除外
+        if bbox is None:
+            continue
+
+        results.append({
+            "track_id": record["track_id"],
+            "bbox": bbox,
+            "source": source
+        })
+
+    return results
+  # --------------------------------------------------
+  # 次フレームの人物の予測結果を取得✅
+  # --------------------------------------------------
+  def get_next_frame_predictions(self) -> list[dict]:
+    """
+    次フレームにおける人物の予測結果を取得する関数
+    
+    Returns:
+        次フレームの人物予測結果
+        [
+          {
+            "track_id": 1,
+            "bbox": [x1, y1, x2, y2]
+          },
+          ...
+        ]
+    """
+    results = []
+
+    for trk in self.trackers:
+      # 次フレームのBBOXを予測
+      bbox = trk.predict_next_bbox()
+
+      # 予測結果を保存
+      results.append({
+        "track_id": int(trk.id + 1),
+        "bbox": bbox
+      })
+
+      return results
 
 def parse_args():
     """Parse input arguments."""
